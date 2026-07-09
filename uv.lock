@@ -1,0 +1,20 @@
+version = 1
+revision = 3
+requires-python = ">=3.13"
+
+[[package]]
+name = "libpff-python"
+version = "20231205"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0b/a3/826777491832478f5e1555a16bc9de794ef0264eac53d213340dddae5bd4/libpff-python-20231205.tar.gz", hash = "sha256:06c218be51321b16dc3b835185ee1cd2fa5c2a1ca856e0390c1d6e4ddf329250", size = 2141621, upload-time = "2023-12-05T15:42:22.945Z" }
+
+[[package]]
+name = "pst-slicer"
+version = "26.07.0"
+source = { editable = "." }
+dependencies = [
+    { name = "libpff-python" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "libpff-python", specifier = ">=20231205" }]

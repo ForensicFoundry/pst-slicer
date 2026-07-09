@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""pst-slicer-baseline entry point.
+
+The ``./bootstrap`` helper rewrites the shebang above to point at the
+project's uv-managed venv. Real logic lives in ``pst_slicer.baseline``
+inside that venv.
+
+Usage:
+    ./pst-slicer-baseline [--verify] [--force] [-o DIR] CONFIG [CONFIG ...]
+
+Chain-of-custody baselining. Given one or more TOML configs, computes
+SHA-256 + size + mtime for every input file each config references (the
+source PST and, when applicable, an on-disk IMID list) and writes a
+BASELINE.txt to the target directory. --verify re-checks a previously
+written baseline against the current on-disk state.
+"""
+
+from __future__ import annotations
+
+import sys
+
+from pst_slicer.baseline import main
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

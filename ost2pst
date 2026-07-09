@@ -1,0 +1,756 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""ost2pst - convert an Outlook OST file to a portable mailbox format.
+
+This is a **completely stand-alone Python 3 script**. It has NO
+dependency on ``pst_slicer`` and uses only the Python standard
+library. Drop it into any tools directory and it works.
+
+What it actually does (and why the name is aspirational on Linux)
+-----------------------------------------------------------------
+There is no free, open-source Linux tool that writes native
+Microsoft PST format. ``libpff``, ``libpst``, and every other
+open-source Personal Folder File library ships read-only support.
+The only tools that can produce a real ``.pst`` file are
+proprietary and Windows-only (Outlook itself, Stellar OST-to-PST,
+Kernel for OST, SysTools, etc.).
+
+For the vast majority of downstream forensic and e-discovery workflows, MBOX or
+per-message EML is a **better** intermediate than PST anyway:
+
+* MBOX and EML are RFC-standardized plain text; PST is a proprietary
+  compound-storage container whose spec is only partially published.
+* MBOX and EML are trivially indexable by e-discovery platforms,
+  every mail client, every ``grep``.
+* MBOX and EML round-trip through ``pst-slicer`` and every other
+  forensic mail tool without loss.
+
+So on Linux this tool converts OST -> MBOX (default) or OST -> per-
+message EML tree, using ``readpst`` from the ``libpst-utils`` package
+as the actual mailbox reader. It wraps ``readpst`` with:
+
+* A file-signature check that refuses to run on anything that is not
+  a Personal Folder File (OST or PST).
+* SHA-256 chain-of-custody hashing of the input file BEFORE and AFTER
+  the conversion, so we can prove the tool did not mutate the
+  evidence. (``readpst`` opens the OST read-only; this check is
+  belt-and-suspenders.)
+* SHA-256 + size fingerprints for every output artifact, written to
+  ``MANIFEST.tsv`` next to the outputs.
+* A ``CONVERSION.txt`` provenance record (invocation, tool version,
+  ``readpst`` version, UTC timestamps, hostname, user, exit code).
+
+If you truly need a native ``.pst`` file (e.g. because the receiving
+party's tooling demands it), pass the produced MBOX/EML tree to a
+Windows-based OST-to-PST converter or import it into Outlook via
+``File -> Open & Export`` on Windows.
+
+Usage
+-----
+    ost2pst [-h] [-v] [--format {mbox,eml}] [--include-deleted]
+            [--force] INPUT OUTPUT_DIR
+
+Exit codes
+----------
+    0    Conversion succeeded and manifest written.
+    1    Conversion attempt failed (readpst returned non-zero).
+    2    Setup problem (bad path, wrong signature, readpst not
+         installed, unwritable output dir, ...).
+    130  Interrupted by user (Ctrl-C).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import getpass
+import hashlib
+import os
+import platform
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import IO, Any
+
+
+PROG = "ost2pst"
+VERSION = "26.07"
+TAGLINE = "Convert Outlook OST to a portable mailbox format"
+_CHUNK = 1024 * 1024  # 1 MiB
+
+
+# ---------------------------------------------------------------------------
+# Palette (self-contained; mirrors pst_slicer.palette but has no imports)
+# ---------------------------------------------------------------------------
+
+
+class _Palette:
+    __slots__ = (
+        "BOLD",
+        "DIM",
+        "RESET",
+        "RED",
+        "GREEN",
+        "YELLOW",
+        "BLUE",
+        "MAGENTA",
+        "CYAN",
+    )
+
+    def __init__(self, enabled: bool) -> None:
+        if enabled:
+            self.BOLD = "\033[1m"
+            self.DIM = "\033[2m"
+            self.RESET = "\033[0m"
+            self.RED = "\033[31m"
+            self.GREEN = "\033[32m"
+            self.YELLOW = "\033[33m"
+            self.BLUE = "\033[34m"
+            self.MAGENTA = "\033[35m"
+            self.CYAN = "\033[36m"
+        else:
+            self.BOLD = self.DIM = self.RESET = ""
+            self.RED = self.GREEN = self.YELLOW = ""
+            self.BLUE = self.MAGENTA = self.CYAN = ""
+
+
+def _color_enabled_for(stream: IO[Any]) -> bool:
+    """Match pst-slicer's precedence:
+        NO_COLOR / OST2PST_NO_COLOR   -> disable regardless of TTY
+        FORCE_COLOR / OST2PST_FORCE_COLOR -> enable regardless of TTY
+        otherwise: only if the stream is a TTY.
+    """
+    env = os.environ
+    if env.get("OST2PST_NO_COLOR") or env.get("NO_COLOR"):
+        return False
+    if env.get("OST2PST_FORCE_COLOR") or env.get("FORCE_COLOR"):
+        return True
+    isatty = getattr(stream, "isatty", None)
+    return bool(isatty()) if callable(isatty) else False
+
+
+def _palette_for(stream: IO[Any]) -> _Palette:
+    return _Palette(_color_enabled_for(stream))
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+
+def _note(msg: str) -> None:
+    p = _palette_for(sys.stdout)
+    sys.stdout.write(f"{p.BLUE}==>{p.RESET} {msg}\n")
+    sys.stdout.flush()
+
+
+def _ok(msg: str) -> None:
+    p = _palette_for(sys.stdout)
+    sys.stdout.write(f"  {p.GREEN}OK:{p.RESET} {msg}\n")
+    sys.stdout.flush()
+
+
+def _warn(msg: str) -> None:
+    p = _palette_for(sys.stderr)
+    sys.stderr.write(f"  {p.YELLOW}WARN:{p.RESET} {msg}\n")
+    sys.stderr.flush()
+
+
+def _err(msg: str) -> None:
+    p = _palette_for(sys.stderr)
+    sys.stderr.write(f"  {p.RED}ERROR:{p.RESET} {msg}\n")
+    sys.stderr.flush()
+
+
+def _header(text: str) -> None:
+    p = _palette_for(sys.stdout)
+    sys.stdout.write(f"\n  {p.BOLD}{text}{p.RESET}\n")
+    sys.stdout.write("  " + ("-" * 40) + "\n")
+    sys.stdout.flush()
+
+
+def _kv(key: str, value: str) -> None:
+    p = _palette_for(sys.stdout)
+    sys.stdout.write(f"    {p.DIM}{key:<28}{p.RESET} {value}\n")
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# argparse machinery with colorized -h/-v
+# ---------------------------------------------------------------------------
+
+
+def _strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
+def _help_row(stream: IO[Any], label_colored: str, description: str) -> None:
+    visible = _strip_ansi(label_colored)
+    padding = max(2, 22 - len(visible))
+    stream.write(f"  {label_colored}{' ' * padding}{description}\n")
+
+
+def _print_version(stream: IO[Any]) -> None:
+    p = _palette_for(stream)
+    stream.write(
+        f"{p.BOLD}{p.BLUE}{PROG}{p.RESET} {p.GREEN}v{VERSION}{p.RESET}\n"
+        f"  {p.DIM}{TAGLINE} - GPL-3.0-or-later{p.RESET}\n"
+    )
+    stream.flush()
+
+
+def _print_usage(stream: IO[Any]) -> None:
+    p = _palette_for(stream)
+    stream.write(
+        f"{p.BOLD}Usage:{p.RESET} "
+        f"{p.BLUE}{PROG}{p.RESET} "
+        f"[{p.GREEN}-h{p.RESET}] "
+        f"[{p.GREEN}-v{p.RESET}] "
+        f"[{p.GREEN}--format {p.YELLOW}mbox|eml{p.RESET}] "
+        f"[{p.GREEN}--include-deleted{p.RESET}] "
+        f"[{p.GREEN}--force{p.RESET}] "
+        f"{p.YELLOW}INPUT{p.RESET} {p.YELLOW}OUTPUT_DIR{p.RESET}\n"
+    )
+    stream.flush()
+
+
+def _print_help(stream: IO[Any]) -> None:
+    p = _palette_for(stream)
+    w = stream.write
+
+    _print_usage(stream)
+    w("\n")
+    w(
+        "Convert an Outlook OST file to a portable, forensically-\n"
+        "preserved mailbox format (MBOX or per-message EML). Uses\n"
+        "readpst from the libpst-utils package to do the actual mailbox\n"
+        "read, wrapped with chain-of-custody hashing, a manifest of\n"
+        "every output artifact, and a provenance record.\n"
+        "\n"
+        "Note: no free Linux tool writes native Microsoft PST format.\n"
+        "This tool converts OST to MBOX or EML tree, which is preferable\n"
+        "for forensic and e-discovery workflows anyway. If you truly\n"
+        "need a .pst file, feed the resulting MBOX/EML tree to a\n"
+        "Windows-based converter.\n"
+    )
+    w("\n")
+
+    w(f"{p.BOLD}Positional arguments:{p.RESET}\n")
+    _help_row(stream, f"{p.YELLOW}INPUT{p.RESET}",
+              "Path to the OST (or PST) file to convert.")
+    _help_row(stream, f"{p.YELLOW}OUTPUT_DIR{p.RESET}",
+              "Directory to write outputs into. Created if absent.")
+    w("\n")
+
+    w(f"{p.BOLD}Options:{p.RESET}\n")
+    _help_row(stream, f"{p.GREEN}-h{p.RESET}, {p.GREEN}--help{p.RESET}",
+              "Show this help message and exit.")
+    _help_row(stream, f"{p.GREEN}-v{p.RESET}, {p.GREEN}--version{p.RESET}",
+              "Show version and exit.")
+    _help_row(stream,
+              f"{p.GREEN}--format {p.YELLOW}{{mbox,eml}}{p.RESET}",
+              "Output format. mbox = one MBOX file per folder;")
+    _help_row(stream, "", "eml = one EML file per message. Default: mbox.")
+    _help_row(stream,
+              f"{p.GREEN}--include-deleted{p.RESET}",
+              "Recover items from the OST's deleted-items area.")
+    _help_row(stream, f"{p.GREEN}--force{p.RESET}",
+              "Overwrite non-empty OUTPUT_DIR.")
+    w("\n")
+
+    w(f"{p.BOLD}Output artifacts:{p.RESET}\n")
+    w(f"  {p.DIM}<OUTPUT_DIR>/messages/            readpst output tree{p.RESET}\n")
+    w(f"  {p.DIM}<OUTPUT_DIR>/MANIFEST.tsv        every output file with sha256+size{p.RESET}\n")
+    w(f"  {p.DIM}<OUTPUT_DIR>/CONVERSION.txt     provenance + invocation record{p.RESET}\n")
+    w("\n")
+
+    w(f"{p.BOLD}Environment variables:{p.RESET}\n")
+    _help_row(stream, f"{p.GREEN}NO_COLOR{p.RESET}, {p.GREEN}OST2PST_NO_COLOR{p.RESET}",
+              "Disable colored output.")
+    _help_row(stream, f"{p.GREEN}FORCE_COLOR{p.RESET}, {p.GREEN}OST2PST_FORCE_COLOR{p.RESET}",
+              "Force colored output.")
+    w("\n")
+
+    w(f"{p.BOLD}Requires:{p.RESET}\n")
+    w(f"  {p.DIM}readpst (Debian/Ubuntu: apt install libpst-utils){p.RESET}\n")
+    w(f"  {p.DIM}         (Fedora/RHEL:  dnf install libpst){p.RESET}\n")
+    w(f"  {p.DIM}         (macOS/brew:   brew install libpst){p.RESET}\n")
+    w("\n")
+
+    w(f"{p.BOLD}Exit codes:{p.RESET}\n")
+    _help_row(stream, f"{p.GREEN}0{p.RESET}", "Conversion succeeded.")
+    _help_row(stream, f"{p.GREEN}1{p.RESET}", "readpst returned non-zero.")
+    _help_row(stream, f"{p.GREEN}2{p.RESET}",
+              "Setup problem (bad path, readpst missing, ...).")
+    _help_row(stream, f"{p.GREEN}130{p.RESET}", "Interrupted by user (Ctrl-C).")
+    stream.flush()
+
+
+class _ColoredAction(argparse.Action):
+    """Base for zero-arg actions that print and exit."""
+
+    def __init__(self, option_strings, dest=argparse.SUPPRESS,
+                 default=argparse.SUPPRESS, help=None):
+        super().__init__(option_strings=option_strings, dest=dest,
+                         default=default, nargs=0, help=help)
+
+
+class _ColoredHelpAction(_ColoredAction):
+    def __call__(self, parser, namespace, values, option_string=None):
+        _print_help(sys.stdout)
+        parser.exit(0)
+
+
+class _ColoredVersionAction(_ColoredAction):
+    def __call__(self, parser, namespace, values, option_string=None):
+        _print_version(sys.stdout)
+        parser.exit(0)
+
+
+class _ColoredArgParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:  # type: ignore[override]
+        _print_usage(sys.stderr)
+        _err(message)
+        raise SystemExit(2)
+
+    def print_usage(self, file: IO[Any] | None = None) -> None:  # type: ignore[override]
+        _print_usage(file or sys.stdout)
+
+    def print_help(self, file: IO[Any] | None = None) -> None:  # type: ignore[override]
+        _print_help(file or sys.stdout)
+
+
+def _build_parser() -> _ColoredArgParser:
+    parser = _ColoredArgParser(prog=PROG, add_help=False)
+    parser.add_argument("-h", "--help", action=_ColoredHelpAction,
+                        help="Show help and exit.")
+    parser.add_argument("-v", "--version", action=_ColoredVersionAction,
+                        help="Show version and exit.")
+    parser.add_argument("--format", choices=("mbox", "eml"), default="mbox",
+                        help="Output format (default: mbox).")
+    parser.add_argument("--include-deleted", action="store_true",
+                        help="Recover items from the deleted-items area.")
+    parser.add_argument("--force", action="store_true",
+                        help="Overwrite non-empty OUTPUT_DIR.")
+    parser.add_argument("input", metavar="INPUT",
+                        help="Path to the OST (or PST) file.")
+    parser.add_argument("output_dir", metavar="OUTPUT_DIR",
+                        help="Directory to write outputs into.")
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# File-signature check
+# ---------------------------------------------------------------------------
+#
+# Both OST and PST files begin with the Personal Folder File (PFF) magic:
+# the 4-byte ASCII sequence "!BDN" (0x21 0x42 0x44 0x4E). We accept both
+# formats here because readpst handles both; a stricter OST-vs-PST
+# discrimination would need to inspect further into the header (bytes 10-11
+# hold the client signature) and provides no practical benefit for the
+# read-only wrapping this tool does.
+
+
+def _looks_like_pff(path: Path) -> bool:
+    try:
+        with path.open("rb") as fh:
+            magic = fh.read(4)
+    except OSError:
+        return False
+    return magic == b"!BDN"
+
+
+# ---------------------------------------------------------------------------
+# Hashing helpers
+# ---------------------------------------------------------------------------
+
+
+def _sha256_of(path: Path) -> tuple[str, int]:
+    """Streamed SHA-256 + size for ``path``. Bounded in RAM for
+    multi-GB files (1 MiB chunks)."""
+    h = hashlib.sha256()
+    size = 0
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(_CHUNK), b""):
+            h.update(chunk)
+            size += len(chunk)
+    return h.hexdigest(), size
+
+
+# ---------------------------------------------------------------------------
+# readpst wrapping
+# ---------------------------------------------------------------------------
+
+
+def _find_readpst() -> Path | None:
+    which = shutil.which("readpst")
+    return Path(which) if which else None
+
+
+def _readpst_version(readpst: Path) -> str:
+    """readpst prints its version on ``-V``. Best-effort; returns
+    'unknown' if the invocation fails for any reason."""
+    try:
+        out = subprocess.run(
+            [str(readpst), "-V"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return "unknown"
+    combined = (out.stdout + out.stderr).strip().splitlines()
+    return combined[0] if combined else "unknown"
+
+
+def _run_readpst(
+    *,
+    readpst: Path,
+    input_path: Path,
+    messages_dir: Path,
+    fmt: str,
+    include_deleted: bool,
+) -> tuple[int, str]:
+    """Invoke ``readpst`` and return ``(exit_code, combined_stdout_stderr)``.
+
+    Flag reference (libpst 0.6.76):
+        -o <dir>   Output directory
+        -e         One file per message (with .eml extensions when possible)
+        -M         MH-style output (one file per message with no extension)
+        -w         Include waste/deleted-items area
+        -D         Include deleted items
+        default    One MBOX per folder
+    """
+    args: list[str] = [str(readpst), "-o", str(messages_dir)]
+    if fmt == "eml":
+        args.append("-e")
+    if include_deleted:
+        args.extend(["-w", "-D"])
+    args.append(str(input_path))
+
+    proc = subprocess.run(
+        args,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode, (proc.stdout + proc.stderr).rstrip()
+
+
+# ---------------------------------------------------------------------------
+# Manifest + provenance writing
+# ---------------------------------------------------------------------------
+
+
+def _write_manifest(messages_dir: Path, manifest_path: Path) -> tuple[int, int]:
+    """Walk ``messages_dir`` and record (relative_path, size, sha256) for
+    every regular file into a TSV. Returns (file_count, total_bytes)."""
+    rows: list[tuple[str, int, str]] = []
+    total_bytes = 0
+    for root, _dirs, files in os.walk(messages_dir):
+        for name in files:
+            p = Path(root) / name
+            if not p.is_file():
+                continue
+            digest, size = _sha256_of(p)
+            rel = p.relative_to(messages_dir)
+            rows.append((str(rel), size, digest))
+            total_bytes += size
+
+    rows.sort(key=lambda r: r[0])
+    with manifest_path.open("w", encoding="utf-8", newline="\n") as fh:
+        fh.write("relative_path\tsize_bytes\tsha256\n")
+        for rel, size, digest in rows:
+            fh.write(f"{rel}\t{size}\t{digest}\n")
+    return len(rows), total_bytes
+
+
+def _write_conversion_record(
+    *,
+    record_path: Path,
+    input_path: Path,
+    input_sha256_pre: str,
+    input_sha256_post: str,
+    input_size: int,
+    output_dir: Path,
+    messages_dir: Path,
+    manifest_path: Path,
+    fmt: str,
+    include_deleted: bool,
+    readpst_path: Path,
+    readpst_version: str,
+    readpst_exit: int,
+    readpst_log_excerpt: str,
+    started_utc: _dt.datetime,
+    ended_utc: _dt.datetime,
+    manifest_files: int,
+    manifest_bytes: int,
+) -> None:
+    def fmt_dt(d: _dt.datetime) -> str:
+        return d.astimezone(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    def safe(fn) -> str:
+        try:
+            return str(fn())
+        except Exception:  # pragma: no cover - defensive
+            return "unknown"
+
+    lines: list[str] = []
+    lines.append(f"{PROG} v{VERSION}")
+    lines.append("=" * 60)
+    lines.append(f"started_utc            : {fmt_dt(started_utc)}")
+    lines.append(f"ended_utc              : {fmt_dt(ended_utc)}")
+    lines.append(f"tool_version           : {PROG} {VERSION}")
+    lines.append(f"hostname               : {safe(socket.gethostname)}")
+    lines.append(f"user                   : {safe(getpass.getuser)}")
+    lines.append(f"python_version         : {platform.python_version()}")
+    lines.append(
+        f"platform               : {platform.system()} {platform.release()} "
+        f"{platform.machine()}"
+    )
+    lines.append(f"readpst_path           : {readpst_path}")
+    lines.append(f"readpst_version        : {readpst_version}")
+    lines.append("")
+    lines.append("Input")
+    lines.append("-" * 60)
+    lines.append(f"input_path             : {input_path}")
+    lines.append(f"input_size_bytes       : {input_size}")
+    lines.append(f"input_sha256_pre       : {input_sha256_pre}")
+    lines.append(f"input_sha256_post      : {input_sha256_post}")
+    lines.append(
+        f"input_unchanged        : "
+        f"{'yes' if input_sha256_pre == input_sha256_post else 'NO - INVESTIGATE'}"
+    )
+    lines.append("")
+    lines.append("Output")
+    lines.append("-" * 60)
+    lines.append(f"output_dir             : {output_dir}")
+    lines.append(f"messages_dir           : {messages_dir}")
+    lines.append(f"format                 : {fmt}")
+    lines.append(f"include_deleted        : {include_deleted}")
+    lines.append(f"manifest_path          : {manifest_path}")
+    lines.append(f"files_written          : {manifest_files}")
+    lines.append(f"bytes_written          : {manifest_bytes}")
+    lines.append("")
+    lines.append("readpst")
+    lines.append("-" * 60)
+    lines.append(f"exit_code              : {readpst_exit}")
+    lines.append("output (first 40 lines):")
+    for line in readpst_log_excerpt.splitlines()[:40]:
+        lines.append(f"  | {line}")
+    lines.append("")
+    lines.append(
+        "Notes: input_sha256_pre / _post prove readpst did not mutate\n"
+        "the OST during conversion. MANIFEST.tsv fingerprints every\n"
+        "output artifact; recompute independently with `sha256sum` for\n"
+        "cross-checking. Preserve CONVERSION.txt + MANIFEST.tsv\n"
+        "alongside the messages tree in the case file."
+    )
+    lines.append("")
+    record_path.write_text("\n".join(lines), encoding="utf-8", newline="\n")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def _dir_is_empty(path: Path) -> bool:
+    try:
+        next(path.iterdir())
+    except StopIteration:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def main(argv: list[str]) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    input_path = Path(args.input).expanduser().resolve()
+    output_dir = Path(args.output_dir).expanduser().resolve()
+
+    if not input_path.is_file():
+        _err(f"INPUT does not exist or is not a regular file: {input_path}")
+        return 2
+
+    if not _looks_like_pff(input_path):
+        _err(
+            f"{input_path} does not have the Personal Folder File (!BDN) "
+            "signature. Expected an OST or PST."
+        )
+        return 2
+
+    readpst = _find_readpst()
+    if readpst is None:
+        _err("readpst is not on PATH. Install with one of:")
+        _err("    Debian/Ubuntu:  sudo apt install libpst-utils")
+        _err("    Fedora/RHEL:    sudo dnf install libpst")
+        _err("    macOS/brew:     brew install libpst")
+        return 2
+
+    if output_dir.exists() and not _dir_is_empty(output_dir) and not args.force:
+        _err(
+            f"OUTPUT_DIR is not empty: {output_dir}. "
+            "Re-run with --force to allow writing into it."
+        )
+        return 2
+
+    messages_dir = output_dir / "messages"
+    manifest_path = output_dir / "MANIFEST.tsv"
+    record_path = output_dir / "CONVERSION.txt"
+
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        messages_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _err(f"cannot create output directories: {exc}")
+        return 2
+
+    _header(f"{PROG} v{VERSION}")
+    _kv("input", str(input_path))
+    _kv("output dir", str(output_dir))
+    _kv("format", args.format)
+    _kv("include deleted", str(args.include_deleted))
+    _kv("readpst", str(readpst))
+    readpst_ver = _readpst_version(readpst)
+    _kv("readpst version", readpst_ver)
+
+    _header("Chain of custody: pre-run hash of input")
+    _note(f"hashing {input_path} (may take a while on multi-GB OSTs)")
+    started_utc = _dt.datetime.now(tz=_dt.timezone.utc).replace(microsecond=0)
+    t0 = time.perf_counter()
+    try:
+        sha_pre, size_in = _sha256_of(input_path)
+    except OSError as exc:
+        _err(f"cannot read input: {exc}")
+        return 2
+    _ok(
+        f"pre-run sha256 = {sha_pre}  size = {size_in:,} bytes  "
+        f"({time.perf_counter() - t0:.1f}s)"
+    )
+
+    _header("Running readpst")
+    _note(
+        f"{readpst} -> {messages_dir} "
+        f"(format={args.format}, deleted={args.include_deleted})"
+    )
+    try:
+        rc, readpst_log = _run_readpst(
+            readpst=readpst,
+            input_path=input_path,
+            messages_dir=messages_dir,
+            fmt=args.format,
+            include_deleted=args.include_deleted,
+        )
+    except KeyboardInterrupt:
+        _err("Interrupted by user during readpst.")
+        return 130
+
+    if rc != 0:
+        _err(f"readpst exited with code {rc}. Excerpt of its output:")
+        for line in readpst_log.splitlines()[:40]:
+            _err(f"    | {line}")
+        # Still attempt to write a partial CONVERSION.txt so the analyst
+        # has a record of the failed attempt.
+        ended_utc = _dt.datetime.now(tz=_dt.timezone.utc).replace(microsecond=0)
+        try:
+            _write_conversion_record(
+                record_path=record_path,
+                input_path=input_path,
+                input_sha256_pre=sha_pre,
+                input_sha256_post="(not computed - readpst failed)",
+                input_size=size_in,
+                output_dir=output_dir,
+                messages_dir=messages_dir,
+                manifest_path=manifest_path,
+                fmt=args.format,
+                include_deleted=args.include_deleted,
+                readpst_path=readpst,
+                readpst_version=readpst_ver,
+                readpst_exit=rc,
+                readpst_log_excerpt=readpst_log,
+                started_utc=started_utc,
+                ended_utc=ended_utc,
+                manifest_files=0,
+                manifest_bytes=0,
+            )
+        except OSError:
+            pass
+        return 1
+
+    _ok("readpst exited cleanly")
+
+    _header("Chain of custody: post-run hash of input")
+    _note("re-hashing input to prove readpst did not mutate the OST")
+    try:
+        sha_post, _ = _sha256_of(input_path)
+    except OSError as exc:
+        _err(f"cannot re-hash input: {exc}")
+        return 2
+    if sha_post != sha_pre:
+        _err("input file changed during conversion. THIS IS UNEXPECTED.")
+        _err(f"    pre  = {sha_pre}")
+        _err(f"    post = {sha_post}")
+    else:
+        _ok(f"post-run sha256 matches: {sha_post}")
+
+    _header("Manifest")
+    _note(f"hashing every output artifact into {manifest_path}")
+    try:
+        n_files, n_bytes = _write_manifest(messages_dir, manifest_path)
+    except OSError as exc:
+        _err(f"cannot write manifest: {exc}")
+        return 2
+    _ok(f"{n_files:,} files, {n_bytes:,} bytes fingerprinted")
+
+    ended_utc = _dt.datetime.now(tz=_dt.timezone.utc).replace(microsecond=0)
+    try:
+        _write_conversion_record(
+            record_path=record_path,
+            input_path=input_path,
+            input_sha256_pre=sha_pre,
+            input_sha256_post=sha_post,
+            input_size=size_in,
+            output_dir=output_dir,
+            messages_dir=messages_dir,
+            manifest_path=manifest_path,
+            fmt=args.format,
+            include_deleted=args.include_deleted,
+            readpst_path=readpst,
+            readpst_version=readpst_ver,
+            readpst_exit=rc,
+            readpst_log_excerpt=readpst_log,
+            started_utc=started_utc,
+            ended_utc=ended_utc,
+            manifest_files=n_files,
+            manifest_bytes=n_bytes,
+        )
+    except OSError as exc:
+        _err(f"cannot write conversion record: {exc}")
+        return 2
+
+    _header("Done")
+    _kv("input unchanged", "yes" if sha_pre == sha_post else "NO - INVESTIGATE")
+    _kv("files written", f"{n_files:,}")
+    _kv("bytes written", f"{n_bytes:,}")
+    _kv("messages dir", str(messages_dir))
+    _kv("manifest", str(manifest_path))
+    _kv("provenance", str(record_path))
+    _ok("conversion complete")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        _err("Interrupted by user.")
+        sys.exit(130)

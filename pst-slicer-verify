@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""pst-slicer-verify entry point.
+
+The ``./bootstrap`` helper rewrites the shebang above to point at the
+project's uv-managed venv.  Real logic lives in ``pst_slicer.verify``
+inside that venv.
+
+Usage:
+    ./pst-slicer-verify <path-to-config.toml>
+
+Runs the four-check verification protocol against a completed
+extraction that used the same config file:
+
+    1. Source PST byte-identical to pre-run baseline
+    2. manifest.tsv rows == EMLs on disk == run.log eml_files_written
+    3. Every EML's SHA-256 + size matches its manifest row
+    4. Coercion audit (informational) of X-PstSlicer-Original-* headers
+"""
+
+from __future__ import annotations
+
+import sys
+
+from pst_slicer.verify import main
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

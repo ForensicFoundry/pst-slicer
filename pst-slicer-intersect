@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""pst-slicer-intersect entry point.
+
+The ``./bootstrap`` helper rewrites the shebang above to point at the
+project's uv-managed venv.  Real logic lives in
+``pst_slicer.intersect`` inside that venv.
+
+Usage:
+    ./pst-slicer-intersect [-o OUT_DIR] <config1.toml> <config2.toml> [...]
+
+Given two or more TOML configs from parallel IMID-mode pst-slicer
+runs, compute the set of IMIDs that were not matched in ANY run
+(intersection of every run's ``not_found.txt``) and write:
+
+    <OUT_DIR>/unmatched_across_all_psts.txt
+    <OUT_DIR>/unmatched_summary.txt
+"""
+
+from __future__ import annotations
+
+import sys
+
+from pst_slicer.intersect import main
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""pst-slicer entry point.
+
+The ``./bootstrap`` helper rewrites the shebang above to point at the
+project's uv-managed venv.  Real logic lives in the ``pst_slicer``
+package installed into that venv.
+"""
+
+from __future__ import annotations
+
+import sys
+
+from pst_slicer.cli import main
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
